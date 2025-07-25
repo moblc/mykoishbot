@@ -15,6 +15,11 @@
     "koishi",
     "plugin"
   ],
+  "dependencies": {
+    "puppeteer": "^24.15.0",
+    "node-imap": "^0.9.6",
+    "axios": "^1.11.0"
+  },
   "devDependencies": {},
   "peerDependencies": {
     "koishi": "^4.18.7"
