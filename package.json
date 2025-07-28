@@ -16,11 +16,11 @@
     "plugin"
   ],
   "dependencies": {
-    "puppeteer": "^24.15.0",
+    "axios": "^1.11.0",
+    "mailparser": "^3.7.4",
     "node-imap": "^0.9.6",
-    "axios": "^1.11.0"
+    "puppeteer": "^24.15.0"
   },
-  "devDependencies": {},
   "peerDependencies": {
     "koishi": "^4.18.7"
   }

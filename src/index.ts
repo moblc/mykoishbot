@@ -1,5 +1,6 @@
 import { Context, Schema, Logger } from 'koishi'
 import Imap from 'node-imap'
+import { simpleParser } from 'mailparser'
 
 export const name = 'mailbot'
 export const inject = ['database']
@@ -27,6 +28,111 @@ export const usage = `
 
 // 创建日志器
 const logger = new Logger('mailbot')
+
+// 使用mailparser解析邮件内容
+async function parseEmailContent(rawEmail: string): Promise<{ text: string; html: string; subject: string }> {
+  try {
+    logger.info('🔍 开始使用mailparser解析邮件...')
+
+    // 使用simpleParser解析邮件
+    const parsed = await simpleParser(rawEmail)
+
+    logger.info('📧 mailparser解析结果:')
+    logger.info('📋 Subject:', parsed.subject || '无主题')
+    logger.info('📝 Text Length:', parsed.text ? parsed.text.length : 0)
+    logger.info('🌐 HTML Length:', parsed.html ? parsed.html.toString().length : 0)
+
+    // 提取文本内容
+    const textContent = parsed.text || ''
+    const htmlContent = parsed.html ? parsed.html.toString() : ''
+
+    logger.info('✅ 邮件解析完成')
+    logger.info('📄 提取的纯文本内容:', textContent)
+
+    return {
+      text: textContent.trim(),
+      html: htmlContent.trim(),
+      subject: parsed.subject || '无主题'
+    }
+  } catch (error) {
+    logger.error('❌ mailparser解析失败:', error)
+    return {
+      text: '',
+      html: '',
+      subject: '解析失败'
+    }
+  }
+}
+
+// 清理邮件正文，提取核心内容
+function cleanEmailContent(rawText: string): string {
+  if (!rawText) return ''
+
+  logger.debug('🧹 开始清理邮件正文...')
+  logger.debug('📝 原始文本:', rawText)
+
+  // 按行分割文本
+  const lines = rawText.split('\n').map(line => line.trim())
+
+  // 查找核心内容的结束位置
+  const coreContent: string[] = []
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+
+    // 跳过空行
+    if (!line) continue
+
+    // 检查是否包含重要信息（验证码、密码等），这些行需要保护
+    const hasImportantInfo = /\b(code|验证码|密码|password|auth|token|key)\b/i.test(line)
+
+    if (hasImportantInfo) {
+      logger.debug(`🔒 检测到重要信息，保护此行: "${line}"`)
+      coreContent.push(line)
+      continue
+    }
+
+    // 检测签名分隔符模式
+    if (
+      line.match(/^[|]+\s*$/) ||           // 只包含 | 字符的行
+      line.match(/^\s*[-]+\s*$/) ||        // 分隔线
+      line.match(/^[|]\s*[|]\s*$/) ||      // | | 模式
+      line.match(/^\s*[|]\s*$/)            // 单独的 | 字符
+    ) {
+      logger.debug(`🚫 检测到签名分隔符，停止提取: "${line}"`)
+      break
+    }
+
+    // 改进的邮箱地址检测：只有当邮箱地址是行的主要内容时才视为签名
+    // 检查是否是纯邮箱地址行或邮箱签名格式
+    const isEmailSignature = (
+      // 纯邮箱地址行
+      /^[^\s]+@[^\s]+\.[^\s]+$/.test(line) ||
+      // 发件人格式: email@domain.com
+      /^(发件人|from|sender):\s*[^\s]+@[^\s]+\.[^\s]+$/i.test(line) ||
+      // 联系方式格式: 邮箱: email@domain.com  
+      /^(邮箱|email|联系):\s*[^\s]+@[^\s]+\.[^\s]+$/i.test(line)
+    )
+
+    if (isEmailSignature) {
+      logger.debug(`🚫 检测到邮箱签名，停止提取: "${line}"`)
+      break
+    }
+
+    // 如果是有意义的内容行，添加到核心内容
+    if (line.length > 0) {
+      logger.debug(`✅ 添加内容行: "${line}"`)
+      coreContent.push(line)
+    }
+  }
+
+  const cleanedText = coreContent.join('\n').trim()
+
+  logger.debug('✅ 邮件正文清理完成')
+  logger.debug(`🎯 清理后内容: "${cleanedText}"`)
+
+  return cleanedText
+}
 
 export interface Config {
   imap: {
@@ -265,6 +371,12 @@ function fetchLatestUnread(): void {
 
     logger.info(`🆕 发现 ${newUids.length} 封新邮件，准备获取详情`)
 
+    // 立即将新邮件UID添加到已处理集合，防止重复处理
+    newUids.forEach(uid => {
+      lastCheckedUids.add(uid)
+      logger.debug(`🔒 UID ${uid} 已标记为正在处理`)
+    })
+
     // 只获取新邮件
     const fetch = imap!.fetch(newUids, {
       bodies: ['HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)', 'TEXT'],
@@ -295,7 +407,11 @@ function fetchLatestUnread(): void {
             }
           } else if (info.which === 'TEXT') {
             // 处理邮件正文
+            logger.debug(`📝 收到邮件正文，长度: ${buffer.length}`)
+            logger.debug(`📄 原始正文内容前200字符:`, buffer.substring(0, 200))
+            logger.debug(`📋 完整原始正文:`, buffer)
             messageData.bodyText = buffer.trim()
+            logger.debug(`✅ 邮件正文已保存，处理后长度: ${messageData.bodyText.length}`)
           }
         })
       })
@@ -304,12 +420,28 @@ function fetchLatestUnread(): void {
         messageData.attributes = attrs
         messageData.uid = attrs.uid
         messageData.flags = attrs.flags
-
-        // 记录已处理的UID
-        lastCheckedUids.add(attrs.uid)
+        logger.debug(`📋 邮件属性已获取: UID ${attrs.uid}, 标志: ${attrs.flags.join(', ')}`)
       })
 
       msg.once('end', () => {
+        // 添加完整邮件对象的调试日志
+        logger.info(`📧 邮件对象完整结构 (UID: ${messageData.uid}):`)
+        logger.info(`📋 Headers:`, JSON.stringify(messageData.headers, null, 2))
+        logger.info(`📄 Body Text Length: ${messageData.bodyText ? messageData.bodyText.length : 0}`)
+        logger.info(`🏷️ Attributes:`, JSON.stringify(messageData.attributes, null, 2))
+        logger.info(`🚩 Flags:`, JSON.stringify(messageData.flags))
+
+        // 如果邮件正文较短，直接显示；如果较长，显示前200字符
+        if (messageData.bodyText) {
+          if (messageData.bodyText.length <= 500) {
+            logger.info(`📝 Complete Body Text:`, messageData.bodyText)
+          } else {
+            logger.info(`📝 Body Text Preview (first 500 chars):`, messageData.bodyText.substring(0, 500) + '...')
+          }
+        }
+
+        logger.info(`📦 Complete Message Object:`, JSON.stringify(messageData, null, 2))
+
         messages.push(messageData)
       })
     })
@@ -361,32 +493,22 @@ function getMonitorStatus(): { isMonitoring: boolean; lastMailCount: number } {
   }
 }
 
-// 删除邮件函数
-function deleteEmailByUid(uid: number): Promise<void> {
+// 标记邮件为已读函数
+function markEmailAsRead(uid: number): Promise<void> {
   return new Promise((resolve, reject) => {
     if (!imap || !isMonitoring) {
       return reject(new Error('IMAP连接不可用'))
     }
 
-    // 标记邮件为删除
-    imap.addFlags(uid, ['\\Deleted'], (err) => {
+    // 标记邮件为已读
+    imap.addFlags(uid, ['\\Seen'], (err) => {
       if (err) {
-        logger.error(`标记邮件删除失败 (UID: ${uid}):`, err.message)
+        logger.error(`标记邮件已读失败 (UID: ${uid}):`, err.message)
         return reject(err)
       }
 
-      logger.debug(`📌 邮件已标记为删除 (UID: ${uid})`)
-
-      // 执行 expunge 操作永久删除
-      imap.expunge((expungeErr) => {
-        if (expungeErr) {
-          logger.error(`执行邮件删除失败 (UID: ${uid}):`, expungeErr.message)
-          return reject(expungeErr)
-        }
-
-        logger.info(`🗑️ 邮件已删除 (UID: ${uid})`)
-        resolve()
-      })
+      logger.info(`� 邮件已标记为已读 (UID: ${uid})`)
+      resolve()
     })
   })
 }
@@ -565,8 +687,34 @@ export function apply(ctx: Context, config: Config) {
 
   // 新邮件通知处理函数
   const handleNewMail = async (messages: any[]) => {
+    logger.info(`🎯 开始处理新邮件通知，收到 ${messages.length} 封邮件`)
+    logger.info(`📊 Messages Array:`, JSON.stringify(messages, null, 2))
+
+    // 检查上下文和通知环境
+    logger.info(`🔧 通知环境检查:`)
+    logger.info(`- Context对象: ${!!ctx}`)
+    logger.info(`- broadcast方法: ${typeof ctx?.broadcast}`)
+    logger.info(`- Koishi环境: ${typeof ctx?.app}`)
+
     for (const msg of messages) {
       const { headers } = msg
+
+      logger.info(`📮 处理邮件 UID: ${msg.uid}`)
+      logger.info(`📧 当前邮件完整对象:`, JSON.stringify(msg, null, 2))
+
+      // 使用mailparser解析邮件内容
+      let parsedContent = { text: '', html: '', subject: headers.subject }
+      if (msg.bodyText) {
+        logger.info('🔄 开始解析邮件正文...')
+        parsedContent = await parseEmailContent(msg.bodyText)
+
+        // 清理邮件正文，提取核心内容
+        if (parsedContent.text) {
+          const cleanedText = cleanEmailContent(parsedContent.text)
+          parsedContent.text = cleanedText
+          logger.info(`🎯 清理后的核心内容: "${cleanedText}"`)
+        }
+      }
 
       // 记录详细的新邮件信息到日志
       logger.info(`📮 收到新邮件！`)
@@ -574,18 +722,24 @@ export function apply(ctx: Context, config: Config) {
       logger.info(`📋 主题: ${headers.subject}`)
       logger.info(`📅 时间: ${headers.date}`)
       logger.info(`🆔 UID: ${msg.uid}`)
+      logger.info(`📝 解析后的文本内容: "${parsedContent.text}"`)
 
       logger.info(`✨ 新邮件已记录: ${headers.subject}`)
 
-      // 处理邮件正文内容
+      // 处理邮件正文内容 - 使用解析后的文本
       let contentPreview = ''
-      if (msg.bodyText) {
-        // 清理正文内容，去除多余的空白字符
-        const cleanText = msg.bodyText.replace(/\s+/g, ' ').trim()
-        // 限制预览长度为200字符
-        contentPreview = cleanText.length > 200
-          ? cleanText.substring(0, 200) + '...'
-          : cleanText
+      if (parsedContent.text) {
+        // 内容格式化：保留重要格式，优化显示，完整显示所有内容
+        contentPreview = parsedContent.text
+          .split('\n')                              // 按行分割
+          .map(line => line.trim())                 // 移除行首行尾空白
+          .filter(line => line.length > 0)         // 移除空行
+          .join('\n')                               // 重新连接，保留换行
+          .replace(/\n{3,}/g, '\n\n')               // 最多保留两个连续换行
+          .replace(/[ \t]+/g, ' ')                  // 合并多个空格/制表符为单个空格
+          .trim()
+
+        logger.debug(`📝 内容处理完成，原长度: ${parsedContent.text.length}，处理后长度: ${contentPreview.length}`)
       }
 
       // 发送机器人通知消息
@@ -599,22 +753,43 @@ export function apply(ctx: Context, config: Config) {
         notificationMsg += `\n📄 内容: ${contentPreview}`
       }
 
-      try {
-        // 广播新邮件通知到所有活跃会话
-        ctx.broadcast(notificationMsg)
-        logger.info(`📢 邮件通知已发送: ${headers.subject}`)
+      logger.info(`📋 通知消息构建完成，长度: ${notificationMsg.length}`)
+      logger.info(`📑 通知消息内容预览: ${notificationMsg.substring(0, 100)}...`)
 
-        // 通知成功后删除邮件
+      try {
+        // 检查上下文状态
+        logger.info(`🔍 检查通知发送条件...`)
+        logger.info(`📱 上下文对象存在: ${!!ctx}`)
+        logger.info(`📡 broadcast方法存在: ${typeof ctx.broadcast === 'function'}`)
+
+        // 记录完整的通知消息
+        logger.info(`📝 准备发送的通知消息:`)
+        logger.info(notificationMsg)
+
+        // 广播新邮件通知到所有活跃会话
+        logger.info(`📤 开始调用 ctx.broadcast()...`)
+
+        const broadcastResult = await ctx.broadcast(notificationMsg)
+
+        logger.info(`✅ ctx.broadcast() 调用完成`)
+        logger.info(`� broadcast返回值:`, broadcastResult)
+        logger.info(`�📢 邮件通知已发送: ${headers.subject}`)
+
+        // 通知成功后标记邮件为已读
         try {
-          await deleteEmailByUid(msg.uid)
-          logger.info(`✅ 邮件已处理并删除: ${headers.subject} (UID: ${msg.uid})`)
-        } catch (deleteError) {
-          logger.error(`删除邮件失败 (UID: ${msg.uid}):`, deleteError.message)
-          logger.warn(`邮件通知已发送但删除失败，可能会重复通知: ${headers.subject}`)
+          await markEmailAsRead(msg.uid)
+          logger.info(`✅ 邮件已处理并标记为已读: ${headers.subject} (UID: ${msg.uid})`)
+        } catch (markReadError) {
+          logger.error(`标记邮件已读失败 (UID: ${msg.uid}):`, markReadError.message)
+          logger.warn(`邮件通知已发送但标记已读失败，可能会重复通知: ${headers.subject}`)
         }
       } catch (error) {
-        logger.error('发送邮件通知失败:', error)
-        logger.warn(`邮件通知失败，不删除邮件: ${headers.subject} (UID: ${msg.uid})`)
+        logger.error('❌ 发送邮件通知失败，详细错误信息:')
+        logger.error('错误类型:', error.constructor.name)
+        logger.error('错误消息:', error.message)
+        logger.error('错误堆栈:', error.stack)
+        logger.error('broadcast方法类型:', typeof ctx.broadcast)
+        logger.warn(`邮件通知失败，不标记邮件为已读: ${headers.subject} (UID: ${msg.uid})`)
       }
     }
   }
